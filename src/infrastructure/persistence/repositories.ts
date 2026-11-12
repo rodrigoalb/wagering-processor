@@ -141,19 +141,6 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
     );
     return rows.map((r) => ({ id: r.id, walletId: r.walletId }));
   }
-
-  async wakeDependents(providerId: string, externalTransactionId: string, now: Date): Promise<number> {
-    return this.em.nativeUpdate(
-      WagerTransactionRecord,
-      {
-        providerId,
-        referenceExternalTransactionId: externalTransactionId,
-        status: WagerTransactionStatus.PendingReference,
-        nextReferenceAttemptAt: { $gt: now },
-      },
-      { nextReferenceAttemptAt: now },
-    );
-  }
 }
 
 class MikroOrmLedgerRepository implements LedgerRepository {

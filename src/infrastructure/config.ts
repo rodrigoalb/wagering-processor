@@ -23,7 +23,7 @@ export interface AppConfig {
   outbox: { enabled: boolean; batchSize: number; leaseMs: number; pollMs: number; retryBaseMs: number; retryMaxMs: number };
   pendingReferences: { enabled: boolean; pollMs: number; batchSize: number; baseDelayMs: number; maxDelayMs: number; maxAttempts: number };
   shutdownTimeoutMs: number;
-  /** Somente testes: simula queda do processo em pontos críticos. */
+  /** Somente testes: simula queda do processo em pontos críticos. Ignorado com NODE_ENV=production. */
   faultInjection?: 'crash-after-commit-before-ack';
 }
 
@@ -71,7 +71,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxAttempts: int(env.PENDING_REFERENCE_MAX_ATTEMPTS, 10),
     },
     shutdownTimeoutMs: int(env.SHUTDOWN_TIMEOUT_MS, 20_000),
-    faultInjection: env.FAULT_INJECTION === 'crash-after-commit-before-ack' ? 'crash-after-commit-before-ack' : undefined,
+    faultInjection:
+      env.NODE_ENV !== 'production' && env.FAULT_INJECTION === 'crash-after-commit-before-ack'
+        ? 'crash-after-commit-before-ack'
+        : undefined,
   };
 }
 

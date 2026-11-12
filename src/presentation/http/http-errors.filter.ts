@@ -33,7 +33,9 @@ export class HttpErrorsFilter implements ExceptionFilter {
     const { status, code, message, details } = this.describe(exception);
 
     if (status === 503) res.setHeader('Retry-After', '1');
-    if (status >= 500) {
+    if (status === 503) {
+      logger.warn({ code, status }, 'falha transitória, o chamador pode reenviar');
+    } else if (status >= 500) {
       logger.error({ code, err: (exception as Error)?.message, stack: (exception as Error)?.stack }, 'erro na requisição');
     } else {
       logger.info({ code, status }, 'requisição recusada');

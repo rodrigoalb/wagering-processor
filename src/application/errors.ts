@@ -22,16 +22,20 @@ export abstract class ApplicationError extends Error {
 export class IdempotencyConflictError extends ApplicationError {
   readonly kind = 'conflict';
   readonly code = 'IDEMPOTENCY_KEY_CONFLICT';
-  constructor(key: string) {
-    super(`Idempotency-Key "${key}" já foi usada com outro payload`);
+  constructor(key: string, detail = 'já foi usada com outro payload') {
+    super(`Idempotency-Key "${key}" ${detail}`);
   }
 }
 
-export class ExternalTransactionConflictError extends ApplicationError {
-  readonly kind = 'conflict';
-  readonly code = 'EXTERNAL_TRANSACTION_CONFLICT';
-  constructor(providerId: string, externalTransactionId: string) {
-    super(`(${providerId}, ${externalTransactionId}) já foi registrada com outra Idempotency-Key`);
+/**
+ * O mesmo messageId chegou de novo com conteúdo diferente. Não é redelivery:
+ * é erro do produtor, e repetir não resolve (vai para a DLQ).
+ */
+export class MessageIdReuseError extends ApplicationError {
+  readonly kind = 'validation';
+  readonly code = 'MESSAGE_ID_REUSED';
+  constructor(messageId: string) {
+    super(`messageId "${messageId}" já foi processado com outro conteúdo`);
   }
 }
 

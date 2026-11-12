@@ -3,11 +3,7 @@ import { Money, MoneyProps } from '../domain/money/money';
 import { newId } from '../domain/shared/id';
 import { FailureCode } from '../domain/wager/failure-code';
 import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wager/wager-transaction';
-import {
-  ExternalTransactionConflictError,
-  IdempotencyConflictError,
-  WalletNotFoundError,
-} from './errors';
+import { IdempotencyConflictError, MessageIdReuseError, WalletNotFoundError } from './errors';
 import { Instrumentation, Source } from './instrumentation';
 import { wagerPayloadHash } from './payload-hash';
 import { Clock, TransactionalRepositories, UnitOfWork } from './ports';
@@ -77,10 +73,17 @@ export class SubmitWagerTransactionUseCase {
           if (ctx.inbox) {
             inbox = InboxMessage.receive({ ...ctx.inbox, receivedAt: now });
             if (!(await r.inbox.tryRegister(inbox))) {
+              // Só é redelivery se o conteúdo for o mesmo. messageId repetido com
+              // outro conteúdo é erro do produtor e não pode ser engolido como duplicata.
+              const previous = await r.inbox.find(ctx.inbox.consumerName, ctx.inbox.messageId);
+              if (previous && previous.payloadHash !== ctx.inbox.payloadHash) {
+                this.instrumentation.duplicateDetected('inbox-payload-mismatch', ctx.source);
+                throw new MessageIdReuseError(ctx.inbox.messageId);
+              }
               this.instrumentation.duplicateDetected('inbox', ctx.source);
               const existing = await r.transactions.findByIdempotencyKey(cmd.idempotencyKey);
               if (existing) return { ...this.toResult(existing, true), duplicateMessage: true };
-              // Inbox registrado sem transação: impossível, ambos são gravados no mesmo commit.
+              // Mesmo conteúdo implica mesma chave, e inbox e transação são gravados no mesmo commit.
               throw new Error(`Inbox ${ctx.inbox.messageId} existe sem transação correspondente`);
             }
           }
@@ -156,9 +159,12 @@ export class SubmitWagerTransactionUseCase {
       this.instrumentation.enrich({ transactionId: existing.id });
       return this.toResult(existing, true);
     }
-    // Mesmo (providerId, externalTransactionId) registrado com outra chave.
-    this.instrumentation.duplicateDetected('external-id-conflict', source);
-    throw new ExternalTransactionConflictError(cmd.providerId, cmd.externalTransactionId);
+    // Mesmo (providerId, externalTransactionId) já registrado com outra chave: também é conflito.
+    this.instrumentation.duplicateDetected('payload-conflict', source);
+    throw new IdempotencyConflictError(
+      cmd.idempotencyKey,
+      `conflita com a transação (${cmd.providerId}, ${cmd.externalTransactionId}), registrada com outra chave`,
+    );
   }
 
   private toResult(tx: WagerTransaction, idempotentReplay: boolean): SubmitResult {

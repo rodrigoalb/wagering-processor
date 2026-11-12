@@ -34,8 +34,6 @@ export interface WagerTransactionRepository {
   updateStatus(tx: WagerTransaction, previousStatus: string): Promise<void>;
   /** Transações em PENDING_REFERENCE vencidas, mais antigas primeiro. */
   findDuePendingReferences(now: Date, limit: number): Promise<{ id: string; walletId: string }[]>;
-  /** Antecipa o reprocessamento das pendentes que esperavam por esta referência. */
-  wakeDependents(providerId: string, externalTransactionId: string, now: Date): Promise<number>;
 }
 
 export interface LedgerPage {

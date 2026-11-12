@@ -118,10 +118,6 @@ export class Migration20261111000001_initial_schema extends Migration {
       create index wager_transactions_pending_due
         on wager_transactions (next_reference_attempt_at) where status = 'PENDING_REFERENCE';
     `);
-    this.addSql(`
-      create index wager_transactions_pending_by_reference
-        on wager_transactions (provider_id, reference_external_transaction_id) where status = 'PENDING_REFERENCE';
-    `);
     this.addSql(`create index wager_transactions_wallet on wager_transactions (wallet_id, created_at);`);
 
     this.addSql(`

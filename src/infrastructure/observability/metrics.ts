@@ -34,12 +34,6 @@ export const metrics = {
     labelNames: ['reason'] as const,
     registers: [registry],
   }),
-  sqsMessages: new Counter({
-    name: 'wagering_sqs_messages_total',
-    help: 'Mensagens SQS consumidas por resultado',
-    labelNames: ['outcome'] as const,
-    registers: [registry],
-  }),
   processingLatency: new Histogram({
     name: 'wagering_processing_duration_seconds',
     help: 'Latência de processamento de uma transação (inclui retries)',
@@ -50,27 +44,6 @@ export const metrics = {
   outboxLag: new Gauge({
     name: 'wagering_outbox_lag_seconds',
     help: 'Idade do evento mais antigo ainda não publicado',
-    registers: [registry],
-  }),
-  outboxPending: new Gauge({
-    name: 'wagering_outbox_pending',
-    help: 'Eventos aguardando publicação',
-    registers: [registry],
-  }),
-  outboxPublished: new Counter({
-    name: 'wagering_outbox_published_total',
-    help: 'Eventos publicados',
-    labelNames: ['event_type'] as const,
-    registers: [registry],
-  }),
-  outboxPublishFailures: new Counter({
-    name: 'wagering_outbox_publish_failures_total',
-    help: 'Falhas de publicação do outbox',
-    registers: [registry],
-  }),
-  pendingReferenceExpired: new Counter({
-    name: 'wagering_pending_reference_expired_total',
-    help: 'Transações rejeitadas por referência inexistente após esgotar tentativas',
     registers: [registry],
   }),
   reconciliationMismatches: new Counter({

@@ -10,7 +10,8 @@ export interface RetryOptions {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Retry limitado para conflitos de concorrência. Cada tentativa refaz a
+ * Retry limitado para conflitos de concorrência rápidos (versão, corrida de
+ * inserção, deadlock, serialização). Cada tentativa refaz a
  * unidade de trabalho inteira (nova transação, nova leitura), então uma
  * corrida de inserção vira replay ou conflito de idempotência na próxima volta.
  * Esgotadas as tentativas, o ConcurrencyConflictError sobe como falha transitória.
@@ -26,7 +27,9 @@ export async function withConcurrencyRetry<T>(
     } catch (err) {
       if (!(err instanceof ConcurrencyConflictError)) throw err;
       instrumentation.concurrencyConflict(err.reason, operation, attempt);
-      if (attempt >= maxAttempts) throw err;
+      // Timeout de lock já esperou o limite inteiro: repetir multiplicaria a espera
+      // segurando conexão. Falha rápido como transitório e o chamador decide reenviar.
+      if (err.reason === 'lock-timeout' || attempt >= maxAttempts) throw err;
       // Backoff com jitter para não sincronizar os concorrentes.
       await sleep(baseDelayMs * attempt + Math.random() * baseDelayMs);
     }

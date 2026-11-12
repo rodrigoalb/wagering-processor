@@ -17,7 +17,6 @@ export const prometheusInstrumentation: Instrumentation = {
     logger.warn({ reason, operation, attempt }, 'conflito de concorrência, refazendo');
   },
   referenceExpired(transactionId) {
-    metrics.pendingReferenceExpired.inc();
     logger.warn({ transactionId }, 'referência não chegou dentro do limite de tentativas');
   },
   reconciliationMismatch(walletId, stored, calculated) {

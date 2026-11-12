@@ -100,10 +100,6 @@ export class WagerProcessor {
       await r.wallets.saveBalance(wallet, previousVersion);
       await r.ledger.insert(entry);
     }
-    if (tx.status === WagerTransactionStatus.Processed) {
-      // Quem esperava por esta transação como referência é reprocessado já.
-      await r.transactions.wakeDependents(tx.providerId, tx.externalTransactionId, now);
-    }
     await r.outbox.enqueue(events.map((e) => OutboxMessage.enqueue(e)));
 
     this.instrumentation.transactionSettled(tx.kind, tx.status, opts.source);

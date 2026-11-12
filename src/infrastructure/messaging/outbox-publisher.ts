@@ -49,7 +49,6 @@ export class OutboxPublisher extends PollingWorker {
       queueUrl = await this.queues.get(this.config.queues.events);
     } catch (err) {
       // SQS indisponível: devolve o lote com backoff em vez de esperar o lease expirar.
-      metrics.outboxPublishFailures.inc(claimed.length);
       logger.warn({ err: (err as Error).message, count: claimed.length }, 'fila de eventos indisponível, lote reagendado');
       for (const message of claimed) {
         message.scheduleRetry(this.clock.now(), { baseDelayMs: retryBaseMs, maxDelayMs: retryMaxMs });
@@ -57,17 +56,10 @@ export class OutboxPublisher extends PollingWorker {
       }
       return 0;
     }
-    const blockedPartitions = new Set<string>();
     let published = 0;
 
     for (const message of claimed) {
       await withLogContext({ correlationId: String(message.payload.correlationId ?? '') }, async () => {
-        // Se um evento da wallet falhou neste lote, os seguintes dela esperam (preserva a ordem).
-        if (blockedPartitions.has(message.partitionKey)) {
-          message.scheduleRetry(this.clock.now(), { baseDelayMs: retryBaseMs, maxDelayMs: retryMaxMs });
-          await this.uow.read.outbox.scheduleRetry(message, owner);
-          return;
-        }
         try {
           await this.sqs.send(
             new SendMessageCommand({
@@ -87,11 +79,8 @@ export class OutboxPublisher extends PollingWorker {
             // Lease expirou e outro publisher assumiu: publicação duplicada, segura por eventId.
             logger.warn({ outboxId: message.id }, 'lease do outbox perdido durante a publicação');
           }
-          metrics.outboxPublished.inc({ event_type: message.eventType });
           published++;
         } catch (err) {
-          blockedPartitions.add(message.partitionKey);
-          metrics.outboxPublishFailures.inc();
           message.scheduleRetry(this.clock.now(), { baseDelayMs: retryBaseMs, maxDelayMs: retryMaxMs });
           await this.uow.read.outbox.scheduleRetry(message, owner).catch(() => undefined);
           logger.warn(
@@ -106,7 +95,6 @@ export class OutboxPublisher extends PollingWorker {
 
   private async updateLagMetrics(): Promise<void> {
     const stats = await this.uow.read.outbox.stats(this.clock.now());
-    metrics.outboxPending.set(stats.pending);
     metrics.outboxLag.set(stats.oldestPendingAgeSeconds);
   }
 }

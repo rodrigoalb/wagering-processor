@@ -6,7 +6,7 @@ import {
   SendMessageCommand,
   SQSClient,
 } from '@aws-sdk/client-sqs';
-import { ApplicationError } from '../../application/errors';
+import { ApplicationError, MessageIdReuseError } from '../../application/errors';
 import { canonicalJson, sha256Hex } from '../../application/payload-hash';
 import { SubmitWagerTransactionUseCase } from '../../application/submit-wager-transaction.use-case';
 import { WagerTransactionKind } from '../../domain/wager/wager-transaction';
@@ -18,6 +18,13 @@ import { metrics } from '../../infrastructure/observability/metrics';
 import { parse, wagerMessageSchema } from '../contracts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Mensagens por recebimento. O lote é processado em sequência dentro da
+ * visibilidade (30 s): com lote pequeno, mesmo no pior caso (cada mensagem
+ * esperando o lock_timeout de 5 s) nenhuma estoura a visibilidade na fila local.
+ */
+const RECEIVE_BATCH_SIZE = 5;
 
 type Disposition =
   | { action: 'ack'; outcome: string }
@@ -74,7 +81,7 @@ export class WagerTransactionsConsumer {
         const res = await this.sqs.send(
           new ReceiveMessageCommand({
             QueueUrl: queueUrl,
-            MaxNumberOfMessages: 10,
+            MaxNumberOfMessages: RECEIVE_BATCH_SIZE,
             WaitTimeSeconds: this.config.consumer.waitTimeSec,
             VisibilityTimeout: this.config.consumer.visibilityTimeoutSec,
             MessageSystemAttributeNames: ['ApproximateReceiveCount', 'MessageGroupId'],
@@ -83,12 +90,23 @@ export class WagerTransactionsConsumer {
         );
         failures = 0;
         const messages = res.Messages ?? [];
+        // Grupos (wallets) com uma mensagem devolvida para retry neste lote.
+        const groupsToRetry = new Set<string>();
         for (let i = 0; i < messages.length; i++) {
+          const message = messages[i]!;
           if (!this.running) {
-            await this.release(queueUrl, messages.slice(i));
+            await this.release(queueUrl, messages.slice(i), 'shutdown');
             break;
           }
-          await this.handle(queueUrl, messages[i]!);
+          const group = message.Attributes?.MessageGroupId;
+          if (group && groupsToRetry.has(group)) {
+            // Uma anterior do mesmo grupo falhou: processar esta agora inverteria a ordem.
+            // Devolvida, ela continua atrás da que falhou (o FIFO segura o grupo).
+            await this.release(queueUrl, [message], 'ordem do grupo');
+            continue;
+          }
+          const disposition = await this.handle(queueUrl, message);
+          if (disposition.action === 'retry' && group) groupsToRetry.add(group);
         }
       } catch (err) {
         failures++;
@@ -122,7 +140,6 @@ export class WagerTransactionsConsumer {
 
       if (disposition.action === 'retry' && receiveCount >= this.config.consumer.maxAttempts) {
         await this.toDlq(queueUrl, message, 'max-attempts', disposition.reason);
-        metrics.sqsMessages.inc({ outcome: 'dlq' });
         return { action: 'dlq', reason: 'max-attempts', detail: disposition.reason } as Disposition;
       }
 
@@ -134,19 +151,16 @@ export class WagerTransactionsConsumer {
             await sleep(10_000);
           }
           await this.ack(queueUrl, message);
-          metrics.sqsMessages.inc({ outcome: disposition.outcome });
           break;
         case 'retry': {
           const delay = Math.min(this.config.consumer.retryBaseDelaySec * 2 ** (receiveCount - 1), 300);
           metrics.retries.inc({ operation: 'sqs-message', reason: disposition.reason });
-          metrics.sqsMessages.inc({ outcome: 'retry' });
           logger.warn({ receiveCount, retryInSec: delay, reason: disposition.reason }, 'mensagem devolvida para nova tentativa');
           await this.changeVisibility(queueUrl, message, delay);
           break;
         }
         case 'dlq':
           await this.toDlq(queueUrl, message, disposition.reason, disposition.detail);
-          metrics.sqsMessages.inc({ outcome: 'dlq' });
           break;
       }
       metrics.processingLatency.observe({ source: 'sqs' }, (performance.now() - started) / 1000);
@@ -193,6 +207,9 @@ export class WagerTransactionsConsumer {
     if (err instanceof ValidationError) {
       return { action: 'dlq', reason: 'invalid-payload', detail: err.message };
     }
+    if (err instanceof MessageIdReuseError) {
+      return { action: 'dlq', reason: 'message-id-reused', detail: err.message };
+    }
     if (err instanceof ApplicationError) {
       switch (err.kind) {
         case 'validation':
@@ -234,9 +251,9 @@ export class WagerTransactionsConsumer {
     }
   }
 
-  private async release(queueUrl: string, messages: Message[]): Promise<void> {
+  private async release(queueUrl: string, messages: Message[], why: 'shutdown' | 'ordem do grupo'): Promise<void> {
     await Promise.all(messages.map((m) => this.changeVisibility(queueUrl, m, 0)));
-    logger.info({ count: messages.length }, 'mensagens não iniciadas devolvidas à fila no shutdown');
+    logger.info({ count: messages.length, why }, 'mensagens não iniciadas devolvidas à fila');
   }
 
   private async toDlq(queueUrl: string, message: Message, reason: string, detail: string): Promise<void> {

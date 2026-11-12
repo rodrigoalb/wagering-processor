@@ -35,9 +35,28 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
         case 'serialization':
         case 'lock-timeout':
           throw new ConcurrencyConflictError((err as Error).message, cls);
+        case 'unknown':
+          // Conexão que morre no meio da transação gera erros genéricos do driver
+          // (ex.: "Transaction query already complete"). Antes de tratar como bug,
+          // confirma se o banco responde: se não responde, é indisponibilidade.
+          if (!(await this.databaseResponds())) {
+            throw new TransientInfrastructureError('Banco de dados indisponível', err);
+          }
+          throw err;
         default:
           throw err;
       }
+    }
+  }
+
+  private async databaseResponds(): Promise<boolean> {
+    try {
+      const probe = this.orm.em.fork().execute('select 1');
+      const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 1_000));
+      await Promise.race([probe, timeout]);
+      return true;
+    } catch {
+      return false;
     }
   }
 }

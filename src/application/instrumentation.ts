@@ -8,7 +8,7 @@ export type Source = 'http' | 'sqs' | 'worker' | 'internal';
  */
 export interface Instrumentation {
   transactionSettled(kind: string, status: string, source: Source): void;
-  duplicateDetected(type: 'idempotent-replay' | 'inbox' | 'payload-conflict' | 'external-id-conflict', source: Source): void;
+  duplicateDetected(type: 'idempotent-replay' | 'inbox' | 'payload-conflict' | 'inbox-payload-mismatch', source: Source): void;
   concurrencyConflict(reason: ConflictReason, operation: string, attempt: number): void;
   referenceExpired(transactionId: string): void;
   reconciliationMismatch(walletId: string, stored: string, calculated: string): void;

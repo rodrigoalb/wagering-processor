@@ -246,7 +246,7 @@ describe('idempotência', () => {
     await submit(url, bet);
     const res = await submit(url, bet, 'outra-chave');
     expect(res.status).toBe(409);
-    expect(res.body.error.code).toBe('EXTERNAL_TRANSACTION_CONFLICT');
+    expect(res.body.error.code).toBe('IDEMPOTENCY_KEY_CONFLICT');
   });
 
   test('header ausente é 400; ordem das chaves do JSON não muda o hash', async () => {

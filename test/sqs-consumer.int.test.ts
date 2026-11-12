@@ -120,6 +120,27 @@ describe('consumidor SQS', () => {
   });
 });
 
+describe('messageId reutilizado', () => {
+  test('mesmo messageId com outro conteúdo vai para a DLQ com motivo próprio e não altera saldo', async () => {
+    const w = await createWallet(url, '100.00');
+    const original = wagerMessage(wagerBody({ playerId: w.playerId, walletId: w.id, kind: 'BET', amount: '10.00' }));
+    await sendMessage(queues.wagerUrl, original, w.id);
+    await waitFor(() => walletBalance(w.id), (b) => b === '90.00');
+
+    // Outro pedido (outra transação, outro valor) reaproveitando o messageId já processado.
+    const other = wagerMessage(wagerBody({ playerId: w.playerId, walletId: w.id, kind: 'BET', amount: '50.00' }), original.messageId);
+    await sendMessage(queues.wagerUrl, other, w.id);
+
+    const dlq = await waitFor(() => drain(queues.dlqUrl, 800), (m) => m.length > 0, 15_000);
+    expect(dlq).toHaveLength(1);
+    expect(dlq[0]!.attributes.failureReason).toBe('message-id-reused');
+    expect(dlq[0]!.body.data.externalTransactionId).toBe(other.data.externalTransactionId);
+    expect(await walletBalance(w.id)).toBe('90.00');
+    expect(await txStatus(other.data.providerId, other.data.externalTransactionId)).toBeUndefined();
+    expect(await queueDepth(queues.wagerUrl)).toBe(0);
+  });
+});
+
 describe('falha transitória: retry com backoff e DLQ após o limite', () => {
   test('banco inacessível: mensagem volta para a fila e, esgotadas as tentativas, vai para a DLQ', async () => {
     const own = await createQueues();

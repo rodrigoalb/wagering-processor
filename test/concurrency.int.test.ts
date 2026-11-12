@@ -14,6 +14,7 @@ import {
   submit,
   testConfig,
   TestQueues,
+  waitFor,
   wagerBody,
   walletBalance,
 } from './support/harness';
@@ -144,5 +145,49 @@ describe('três instâncias (processos separados) ao mesmo tempo', () => {
 
     const [{ n }] = await sql`select count(*)::int as n from wager_transactions where wallet_id = ${w.id} and kind = 'BET'`;
     expect(n).toBe(30);
+  });
+
+  test('worker de referências pendentes em várias instâncias: cada pendente é liquidada uma única vez', async () => {
+    // Quatro workers disputam as mesmas pendentes: as 3 instâncias acima e a aplicação do teste.
+    const target = instances[0]!.url;
+    const w = await createWallet(target, '100.00');
+    const base = { playerId: w.playerId, walletId: w.id };
+
+    // 15 ROLLBACKs chegam antes das BETs; 5 REFUNDs apontam para apostas que nunca chegarão.
+    const betIds = Array.from({ length: 15 }, (_, i) => `bet-late-${w.id}-${i}`);
+    const rollbacks = await Promise.all(
+      betIds.map((ref) => submit(target, wagerBody({ ...base, kind: 'ROLLBACK', amount: '4.00', referenceExternalTransactionId: ref }))),
+    );
+    const orphans = await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        submit(target, wagerBody({ ...base, kind: 'REFUND', amount: '4.00', referenceExternalTransactionId: `nunca-${w.id}-${i}` })),
+      ),
+    );
+    expect([...rollbacks, ...orphans].every((r) => r.status === 202)).toBe(true);
+
+    await Promise.all(betIds.map((ext) => submit(target, wagerBody({ ...base, kind: 'BET', amount: '4.00', externalTransactionId: ext }))));
+
+    const ids = [...rollbacks, ...orphans].map((r) => r.body.transactionId as string);
+    type Row = { id: string; status: string; failure_code: string | null };
+    const finalRows = await waitFor<Row[]>(
+      async () => [...(await sql`select id, status, failure_code from wager_transactions where id in ${sql(ids)}`)],
+      (rows) => rows.every((r) => r.status === 'PROCESSED' || r.status === 'REJECTED'),
+      30_000,
+    );
+    const byId = new Map(finalRows.map((r) => [r.id, r]));
+    for (const r of rollbacks) expect(byId.get(r.body.transactionId)!.status).toBe('PROCESSED');
+    for (const r of orphans) expect(byId.get(r.body.transactionId)).toMatchObject({ status: 'REJECTED', failure_code: 'REFERENCE_NOT_FOUND' });
+
+    // 15 apostas debitadas e 15 revertidas: saldo volta ao inicial, com exatamente um crédito por rollback.
+    expect(await walletBalance(w.id)).toBe('100.00');
+    expect(await ledgerCount(w.id, 'DEBIT')).toBe(15);
+    expect(await ledgerCount(w.id, 'CREDIT')).toBe(1 + 15); // OPENING + rollbacks
+    // Um único evento de resultado por pendente, mesmo com 4 workers concorrendo.
+    const events = await sql`
+      select aggregate_id, count(*)::int as n from outbox_messages
+       where aggregate_id in ${sql(ids)} and event_type in ('WagerTransactionProcessed', 'WagerTransactionRejected')
+       group by aggregate_id`;
+    expect(events).toHaveLength(20);
+    expect(events.every((e: { n: number }) => e.n === 1)).toBe(true);
   });
 });

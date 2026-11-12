@@ -322,3 +322,52 @@ export async function ledgerCount(walletId: string, direction?: 'DEBIT' | 'CREDI
     : await sql`select count(*)::int as n from ledger_entries where wallet_id = ${walletId}`;
   return row.n;
 }
+
+// ----------------------------------------------------------------- indisponibilidade
+
+/**
+ * Proxy TCP na frente do PostgreSQL real. `stop()` derruba o listener e todas
+ * as conexões abertas: para a aplicação, o banco ficou fora do ar de verdade
+ * (conexões caem, novas são recusadas). `start()` traz de volta na mesma porta.
+ */
+export function postgresProxy() {
+  const net = require('node:net') as typeof import('node:net');
+  const target = new URL(TEST_DATABASE_URL);
+  const sockets = new Set<import('node:net').Socket>();
+  let server: import('node:net').Server | undefined;
+  let port = 0;
+
+  const start = () =>
+    new Promise<void>((resolve, reject) => {
+      server = net.createServer((client) => {
+        const upstream = net.connect(Number(target.port), target.hostname);
+        for (const s of [client, upstream]) {
+          sockets.add(s);
+          s.on('error', () => undefined);
+          s.on('close', () => {
+            sockets.delete(s);
+            client.destroy();
+            upstream.destroy();
+          });
+        }
+        client.pipe(upstream);
+        upstream.pipe(client);
+      });
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', () => {
+        port = (server!.address() as import('node:net').AddressInfo).port;
+        resolve();
+      });
+    });
+
+  const stop = () =>
+    new Promise<void>((resolve) => {
+      for (const s of sockets) s.destroy();
+      if (!server) return resolve();
+      server.close(() => resolve());
+      server = undefined;
+    });
+
+  const url = () => `postgres://${target.username}:${target.password}@127.0.0.1:${port}${target.pathname}`;
+  return { start, stop, url };
+}

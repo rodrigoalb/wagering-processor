@@ -80,18 +80,19 @@ bun run infra:up
 bun run test
 ```
 
-Os testes de integração usam o PostgreSQL e o LocalStack reais do compose: banco `wagering_test` (recriado pelas migrations a cada arquivo) e filas exclusivas por arquivo. Vários testes sobem a aplicação como **processos separados** e os matam com `SIGKILL`/`SIGTERM`. Resultado atual: **158 testes, 0 falhas**, cerca de 1 minuto.
+Os testes de integração usam o PostgreSQL e o LocalStack reais do compose: banco `wagering_test` (recriado pelas migrations a cada arquivo) e filas exclusivas por arquivo. Vários testes sobem a aplicação como **processos separados** e os matam com `SIGKILL`/`SIGTERM`. Resultado atual: **178 testes, 0 falhas**, cerca de 1 minuto (a suíte foi repetida 10 vezes seguidas, sempre verde).
 
 Cobertura dos cenários obrigatórios da seção 13 do desafio:
 
 | Cenário | Arquivo |
 |---|---|
-| Money, Wallet, regras de BET/WIN/LOSS/REFUND/ROLLBACK, conflito de moeda, payload divergente | `src/**/*.spec.ts` |
+| Money, Wallet, regras de BET/WIN/LOSS/REFUND/ROLLBACK, conflito de moeda, idempotency key com payload divergente | `src/**/*.spec.ts` |
 | Migrations e constraints | `test/schema.int.test.ts` |
 | Atomicidade entre wallet, ledger, inbox e outbox | `test/atomicity.int.test.ts` |
-| Inbox e redelivery; retry e DLQ | `test/sqs-consumer.int.test.ts` |
+| Inbox e redelivery; retry e DLQ; `messageId` reutilizado | `test/sqs-consumer.int.test.ts` |
+| PostgreSQL indisponível (503 e recuperação); timeout de lock por HTTP e SQS | `test/resilience.int.test.ts` |
 | Publishers concorrentes sobre o mesmo outbox | `test/outbox.int.test.ts` |
-| Mesma aposta 50 vezes em paralelo; 100/80/80; wallets distintas; 3 processos | `test/concurrency.int.test.ts` |
+| Mesma aposta 50 vezes em paralelo; 100/80/80; wallets distintas; 3 processos; worker de pendentes com várias instâncias | `test/concurrency.int.test.ts` |
 | Worker morto depois do commit e antes do ack; SIGTERM; reinício com consistência | `test/recovery.int.test.ts` |
 | ROLLBACK/REFUND antes da referência | `test/wagering-api.int.test.ts` |
 | Invariante `wallet.balance == saldo do ledger` | `afterAll` de todos os arquivos de integração |

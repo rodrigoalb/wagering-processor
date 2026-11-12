@@ -85,7 +85,8 @@ src/
 - `SET LOCAL lock_timeout` limita quanto tempo uma requisição espera por uma wallet quente (default 5 s).
 - As escritas são **explícitas** (`em.insert`, `em.nativeUpdate`) em vez do flush implícito da Unit of Work. A ordem dos comandos importa para os triggers (a wallet é atualizada antes do lançamento), e o `UPDATE ... WHERE version = ?` fica visível no código em vez de escondido no ORM.
 - Isolamento `READ COMMITTED` (padrão do PostgreSQL). A correção não depende de `SERIALIZABLE`: depende da trava da linha, das releituras feitas depois dela e das constraints.
-- Erros do banco são traduzidos na fronteira da infraestrutura: violação de unique, deadlock, serialização e timeout de lock viram `ConcurrencyConflictError` (refaz a unidade inteira); falha de conexão vira `TransientInfrastructureError`.
+- Erros do banco são traduzidos na fronteira da infraestrutura: violação de unique, deadlock, serialização e timeout de lock viram `ConcurrencyConflictError`; falha de conexão vira `TransientInfrastructureError`.
+- Quando a conexão cai no meio de uma transação, o driver às vezes devolve um erro genérico, sem SQLSTATE (ex.: "Transaction query already complete"). Para um erro não reconhecido, a Unit of Work verifica se o banco responde (`select 1`, limite de 1 s): se não responde, o erro é tratado como indisponibilidade (503), não como bug (500). Esse caso foi encontrado pelo teste que derruba o banco durante uma requisição.
 
 ## 4. Money
 
@@ -104,7 +105,8 @@ Estratégia combinada, em camadas:
 1. **Lock pessimista por wallet** (`SELECT ... FOR UPDATE` na linha da wallet). Operações da mesma wallet são serializadas; wallets diferentes andam em paralelo.
 2. **UPDATE condicionado à versão** (`UPDATE wallets ... WHERE id = ? AND version = ?`). Redundante com o lock, mas se algum caminho futuro esquecer o lock, o lost update vira erro em vez de corromper o saldo.
 3. **Constraints e triggers no banco** (seção 7): mesmo com bug na aplicação, saldo negativo, lançamento desbalanceado e saldo sem lançamento são recusados.
-4. **Retry limitado** (até 5 tentativas, backoff curto com jitter) para conflitos de concorrência. Cada tentativa refaz a transação inteira, com leituras novas.
+4. **Retry limitado** (até 5 tentativas, backoff curto com jitter) para conflitos rápidos: corrida de inserção, deadlock, serialização e versão alterada. Cada tentativa refaz a transação inteira, com leituras novas.
+5. **Timeout de lock não é refeito.** Quem esperou o `lock_timeout` inteiro já gastou o orçamento de espera: repetir multiplicaria a latência segurando conexão. A requisição falha na hora com 503 e `Retry-After`, e o provedor reenvia com a mesma chave (pela fila, a mensagem volta com backoff).
 
 **Por que pessimista e não só otimista:** o cenário típico de iGaming é a *hot wallet* (um jogador fazendo muitas apostas por segundo, provedores reenviando). Com lock otimista puro, N requisições concorrentes leem a mesma versão, uma vence e N-1 refazem, o que gera tempestade de retries e latência imprevisível. Com o lock da linha, elas entram em fila no próprio PostgreSQL, cada uma é feita uma vez e o tempo de espera é limitado por `lock_timeout`. O custo é segurar uma conexão enquanto espera, o que o `lock_timeout` e o pool limitam.
 
@@ -119,11 +121,16 @@ Estratégia combinada, em camadas:
 - A deduplicação é **persistente**: unique em `idempotency_key` e em `(provider_id, external_transaction_id)`. Não existe cache em memória.
 - Mesma chave e mesmo hash: **replay**, devolve o resultado gravado (`transactionId`, `status`, `failureCode`, `balance` observado naquele momento) com `idempotentReplay: true`.
 - Mesma chave e hash diferente: **409 `IDEMPOTENCY_KEY_CONFLICT`**, nunca replay.
-- Mesmo `(providerId, externalTransactionId)` com outra chave: **409 `EXTERNAL_TRANSACTION_CONFLICT`**.
+- Mesmo `(providerId, externalTransactionId)` com outra chave: também **409 `IDEMPOTENCY_KEY_CONFLICT`**. O par é único no banco (a referência de REFUND/ROLLBACK é resolvida por ele), então uma segunda chave para a mesma transação do provedor é conflito.
 
 **Corrida entre duplicatas:** a busca pela chave é feita antes e **de novo depois** do lock da wallet. Quem esperava o lock vê o commit de quem passou antes e devolve replay. Se duas requisições com a mesma chave apontarem para wallets diferentes (payload diferente), ambas tentam inserir e a unique do banco barra uma. O `ConcurrencyConflictError` faz a unidade ser refeita, e na segunda volta a busca encontra o registro e responde conflito. A decisão replay/conflito é tomada sobre o registro encontrado, não sobre qual consulta o encontrou: em `READ COMMITTED` dois SELECTs seguidos podem ver snapshots diferentes (essa corrida foi encontrada pelo teste de 50 envios paralelos e corrigida).
 
-**Inbox (fila):** `INSERT ... ON CONFLICT (consumer_name, message_id) DO NOTHING` na mesma transação do processamento. Se a mesma mensagem chega em paralelo, a segunda inserção espera o commit da primeira e então não insere nada: é duplicata, e o consumidor faz ack devolvendo o resultado original.
+**Inbox (fila):** `INSERT ... ON CONFLICT (consumer_name, message_id) DO NOTHING` na mesma transação do processamento. Se a mesma mensagem chega em paralelo, a segunda inserção espera o commit da primeira e então não insere nada. Nesse ponto o `payloadHash` gravado no inbox é comparado com o da mensagem recebida:
+
+- **igual:** é redelivery; o consumidor faz ack devolvendo o resultado original;
+- **diferente:** o produtor reutilizou o `messageId` em outro pedido. Não é duplicata e não pode ser engolida em silêncio: a mensagem vai para a DLQ com `failureReason = message-id-reused`.
+
+O hash do inbox é o SHA-256 do JSON canônico da mensagem inteira.
 
 ## 7. Garantias no schema do banco
 
@@ -149,7 +156,7 @@ Tudo em `src/infrastructure/persistence/migrations/` (migration reversível, `up
 | Inbox único | `PRIMARY KEY (consumer_name, message_id)` |
 | Evento único no outbox | índice único em `payload->>'eventId'` |
 
-Índices de apoio: pendentes vencidas (`next_reference_attempt_at` parcial), pendentes por referência (para acordá-las quando a referência chega), outbox vencido (`next_attempt_at` parcial onde `published_at IS NULL`).
+Índices de apoio: pendentes vencidas (`next_reference_attempt_at` parcial, só linhas em `PENDING_REFERENCE`) e outbox vencido (`next_attempt_at` parcial onde `published_at IS NULL`). Os dois são parciais porque as consultas dos workers só olham para a pequena fração de linhas ainda em aberto.
 
 ## 8. Máquina de estados da transação
 
@@ -165,7 +172,11 @@ PROCESSED, REJECTED, FAILED: terminais
 
 ## 9. Regras de negócio e interpretações adotadas
 
-- **Reversão única por referência, independente do tipo.** A regra 4 do desafio diz "pelo mesmo tipo de operação". Interpretei de forma mais estrita: uma BET pode ser revertida **uma vez no total**, por REFUND **ou** ROLLBACK. Permitir os dois creditaria a mesma aposta duas vezes, o que viola "não duplicar créditos". Um ROLLBACK de um REFUND continua permitido (é outra referência). O índice único parcial garante isso no banco.
+- **Reversão única por referência, independente do tipo.** A regra 4 do desafio diz que uma referência não pode ser revertida duas vezes "pelo mesmo tipo de operação". Adotei a leitura mais estrita: uma BET pode ser revertida **uma vez no total**, por REFUND **ou** por ROLLBACK.
+  - **Por quê:** na leitura literal, uma BET de 10 poderia receber um REFUND (+10) e depois um ROLLBACK (+10). O jogador terminaria com 10 a mais do que tinha antes de apostar, o que viola a invariante global "não duplicar créditos". Entre uma regra ambígua e uma invariante explícita, a invariante prevalece.
+  - **Compatibilidade:** a leitura estrita nunca permite o que a literal proíbe (dois REFUNDs ou dois ROLLBACKs da mesma referência continuam rejeitados). A única diferença é rejeitar o segundo tipo de reversão, com `REFERENCE_ALREADY_REVERSED`.
+  - **Como desfazer uma reversão:** um ROLLBACK **do REFUND** continua permitido (é outra referência) e debita o valor devolvido.
+  - **Onde está:** índice único parcial `wager_transactions_one_reversal_per_reference` e `WagerSettlement.referenceViolation`. Para adotar a leitura literal, bastaria incluir `kind` nesse índice e na consulta `hasProcessedReversal`.
 - **WIN e LOSS podem referenciar a BET** (opcional). Se referenciam, a referência passa pelas mesmas validações de escopo (provider, player, wallet, moeda, rodada) e entra em `PENDING_REFERENCE` se ainda não chegou.
 - **LOSS aceita valor zero** (não move saldo). As demais operações exigem valor positivo.
 - **Referência existente mas ainda pendente** (ex.: ROLLBACK de um REFUND que espera a própria BET): a transação também fica em `PENDING_REFERENCE`.
@@ -181,7 +192,7 @@ PROCESSED, REJECTED, FAILED: terminais
 - O evento `WagerTransactionPendingReference` é publicado **uma vez**, quando ela entra em espera.
 - Um worker agendado (todas as instâncias, sem coordenação) busca as vencidas, trava a wallet, **relê o status depois do lock** e reprocessa. Se outra instância já tratou, pula.
 - **Backoff exponencial:** 2 s, 4 s, 8 s, ... limitado a 120 s, por **10 tentativas** (cerca de 8 minutos no total). Justificativa: referências fora de ordem normalmente chegam em segundos (reordenação da rede ou da fila); poucos minutos cobrem reprocessamentos de provedores sem deixar transações penduradas por horas. Tudo é configurável (`PENDING_REFERENCE_*`).
-- **Atalho:** quando uma transação é processada, as pendentes que a referenciam têm `next_reference_attempt_at` antecipado para agora, então são reprocessadas no próximo ciclo do worker (100 ms a 1 s), sem esperar o backoff.
+- Quando a referência chega, a pendente é aplicada na próxima tentativa agendada (não há atalho: no pior caso espera o intervalo de backoff corrente).
 - Esgotadas as tentativas: `REJECTED` com `REFERENCE_NOT_FOUND` e evento `WagerTransactionRejected`.
 
 ## 11. Códigos de falha
@@ -200,7 +211,7 @@ PROCESSED, REJECTED, FAILED: terminais
 | `REFERENCE_AMOUNT_MISMATCH` | Valor diferente da referência | Corrigir o payload |
 | `INTERNAL_ERROR` | Status FAILED no reprocessamento | Contatar a operação |
 
-Erros sem transação persistida usam `error.code`: `VALIDATION_ERROR`, `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`, `WALLET_NOT_FOUND`, `WALLET_ALREADY_EXISTS`, `TRANSACTION_NOT_FOUND`, `INVALID_CURSOR`, `CONCURRENCY_CONFLICT`, `TRANSIENT_FAILURE`.
+Erros sem transação persistida usam `error.code`: `VALIDATION_ERROR`, `IDEMPOTENCY_KEY_CONFLICT`, `WALLET_NOT_FOUND`, `WALLET_ALREADY_EXISTS`, `TRANSACTION_NOT_FOUND`, `INVALID_CURSOR`, `CONCURRENCY_CONFLICT`, `TRANSIENT_FAILURE`. Pela fila existe ainda `MESSAGE_ID_REUSED` (seção 6).
 
 ## 12. Mapeamento de status HTTP
 
@@ -213,16 +224,17 @@ O mesmo mapeamento vale em todos os endpoints (`presentation/http/http-errors.fi
 | 202 | Aceita, `PENDING_REFERENCE` | Não; consultar depois |
 | 400 | Payload inválido (formato, Money, header ausente, JSON malformado) | Só depois de corrigir |
 | 404 | Recurso da URL inexistente | Não |
-| 409 | Conflito de idempotência / id externo / wallet duplicada | Não |
+| 409 | Conflito de idempotência / wallet duplicada | Não |
 | 422 | Rejeição por regra de negócio (corpo traz `status: REJECTED` e `failureCode`) | Não |
-| 503 | Falha transitória (banco fora, lock esgotado); header `Retry-After` | **Sim**, com a mesma chave |
+| 503 | Falha transitória (banco fora do ar, timeout de lock da wallet); header `Retry-After` | **Sim**, com a mesma chave |
 | 500 | Erro inesperado / transação FAILED | Contatar a operação |
 
 Replay de uma rejeição continua 422 (com `idempotentReplay: true`); replay de pendente continua 202.
 
 ## 13. Consumo SQS
 
-- Laços de `ReceiveMessage` (long polling) com concorrência configurável por instância. Dentro de um lote, as mensagens são processadas em sequência.
+- Laços de `ReceiveMessage` (long polling) com concorrência configurável por instância. Cada recebimento traz até **5 mensagens**, processadas em sequência. O lote é pequeno de propósito: mesmo no pior caso (cada mensagem esperando o `lock_timeout` de 5 s), todas terminam dentro da visibilidade de 30 s, então nenhuma é reentregue a outra instância enquanto espera na fila local.
+- **Ordem do grupo depois de uma falha:** se uma mensagem é devolvida para retry, as seguintes do mesmo `MessageGroupId` naquele lote não são processadas: são devolvidas à fila e continuam atrás da que falhou. Sem isso, a segunda aposta de uma wallet poderia ser aplicada antes da primeira.
 - **Ack só depois do commit:** o `DeleteMessage` vem depois de `uow.run()` retornar. Se o processo morre entre os dois, a mensagem reaparece e o inbox a absorve (testado com injeção de falha real: o processo se mata com SIGKILL depois do commit).
 - Classificação:
 
@@ -231,7 +243,7 @@ Replay de uma rejeição continua 422 (com `idempotentReplay: true`); replay de 
 | Sucesso / duplicata | PROCESSED, REJECTED, PENDING_REFERENCE, replay, inbox duplicado | ack |
 | Negócio (terminal) | conflito de idempotência, wallet inexistente | ack + log + métrica |
 | Transitório | banco fora, timeout de lock, conflito que esgotou o retry, erro inesperado | sem ack; `ChangeMessageVisibility` com backoff exponencial (2 s, 4 s, ... até 300 s) |
-| Permanente | JSON malformado, contrato inválido, Money inválido, erro de domínio inesperado | envia para a DLQ com `failureReason` e remove |
+| Permanente | JSON malformado, contrato inválido, Money inválido, `messageId` reutilizado com outro conteúdo, erro de domínio inesperado | envia para a DLQ com `failureReason` e remove |
 | Tentativas esgotadas | `ApproximateReceiveCount >= SQS_MAX_ATTEMPTS` (5) e ainda transitório | DLQ com `failureReason = max-attempts` |
 
 - A redrive policy da fila (`maxReceiveCount` 6) é rede de segurança caso o próprio consumidor não consiga mover a mensagem.
@@ -244,13 +256,13 @@ Replay de uma rejeição continua 422 (com `idempotentReplay: true`); replay de 
 - O publisher reivindica um lote com `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)` gravando `locked_by` e `locked_until` (lease de 30 s). A transação da reivindicação é curta: a publicação no SQS acontece fora dela, sem segurar locks durante I/O de rede.
 - Publishers concorrentes pegam lotes disjuntos. Um publisher que morre depois de reivindicar perde o lease, e outro assume quando ele expira.
 - Publicou e morreu antes de marcar: o evento é publicado de novo (at-least-once). Isso é seguro porque `MessageDeduplicationId = eventId` (o FIFO deduplica por 5 minutos) e o consumidor tem o `eventId` estável para deduplicar.
-- Falha de publicação: `attempts++` e backoff exponencial (1 s até 60 s). Se um evento de uma wallet falha num lote, os seguintes da mesma wallet naquele lote também são adiados, para preservar a ordem.
+- Falha de publicação: `attempts++` e backoff exponencial (1 s até 60 s). Se a fila de eventos estiver inacessível, o lote inteiro é reagendado.
 - Eventos: `WagerTransactionProcessed` (inclusive LOSS e OPENING), `WagerTransactionRejected`, `WalletBalanceChanged` (somente quando o saldo muda) e `WagerTransactionPendingReference`. Cada um é uma subclasse de `IntegrationEvent` com `eventType` e `version` no tipo; `data` carrega `MoneyProps` (string), nunca a instância de `Money`.
 - `partitionKey` (= `MessageGroupId`) é o `walletId` em todos os eventos. `aggregateId` é o id da transação para eventos de transação e o id da wallet para `WalletBalanceChanged`.
 
 ## 15. Observabilidade
 
-- **Logs** JSON (pino) com `correlationId`, `messageId`, `transactionId`, `walletId`, `providerId` e `instanceId`, propagados por `AsyncLocalStorage`. O `correlationId` vem do header `X-Correlation-Id` (ou é gerado) e é devolvido na resposta. Os logs não incluem payloads nem valores; há `redact` como defesa extra para chaves como `money`, `amount`, `balance`, `payload`. A única exceção é o alerta de divergência de reconciliação, que registra os dois saldos de propósito.
+- **Logs** JSON (pino) com `correlationId`, `messageId`, `transactionId`, `walletId`, `providerId` e `instanceId`, propagados por `AsyncLocalStorage`. Falha transitória (503) é registrada como aviso; erro inesperado (500), como erro com stack. O `correlationId` vem do header `X-Correlation-Id` (ou é gerado) e é devolvido na resposta. Os logs não incluem payloads nem valores; há `redact` como defesa extra para chaves como `money`, `amount`, `balance`, `payload`. A única exceção é o alerta de divergência de reconciliação, que registra os dois saldos de propósito.
 - **Métricas** Prometheus em `GET /metrics`:
 
 | Métrica | O quê |
@@ -260,9 +272,9 @@ Replay de uma rejeição continua 422 (com `idempotentReplay: true`); replay de 
 | `wagering_retries_total{operation,reason}` | retries de concorrência e de mensagens SQS |
 | `wagering_dlq_messages_total{reason}` | mensagens enviadas à DLQ |
 | `wagering_lock_conflicts_total{reason}` | versão, timeout de lock, deadlock, corrida de unique |
-| `wagering_outbox_lag_seconds`, `wagering_outbox_pending` | idade do evento mais antigo não publicado e tamanho da fila |
+| `wagering_outbox_lag_seconds` | idade do evento mais antigo ainda não publicado |
 | `wagering_processing_duration_seconds{source}` | latência (histograma) |
-| `wagering_outbox_published_total`, `wagering_outbox_publish_failures_total`, `wagering_sqs_messages_total{outcome}`, `wagering_pending_reference_expired_total`, `wagering_reconciliation_mismatches_total` | apoio a diagnóstico |
+| `wagering_reconciliation_mismatches_total` | divergências entre saldo e ledger (exigida pela reconciliação) |
 
 - **Health:** `GET /health/live` não depende de nada externo; `GET /health/ready` verifica PostgreSQL (`select 1`) e SQS (`GetQueueAttributes`) com timeout de 2 s e responde 503 se algum falhar.
 
@@ -285,23 +297,25 @@ Desenho que eu adotaria:
 
 ## 17. Estratégia de testes
 
-- **Unitários** (`src/**/*.spec.ts`): Money (escala, exatidão, entradas inválidas), Wallet e invariantes, ledger, máquina de estados, regras de BET/WIN/LOSS/REFUND/ROLLBACK, conflito de moeda, payloadHash e conflito de idempotência, outbox e inbox.
+- **Unitários** (`src/**/*.spec.ts`): Money (escala, exatidão, entradas inválidas), Wallet e invariantes, ledger, máquina de estados, regras de BET/WIN/LOSS/REFUND/ROLLBACK, conflito de moeda, payloadHash, outbox e inbox. O caso de uso de submissão é testado com repositórios em memória (`application/testing/`): replay, idempotency key com payload divergente, `messageId` reutilizado e a política de retry. Esses fakes servem só aos unitários; nenhuma garantia de concorrência é provada com eles.
 - **Integração** (`test/*.int.test.ts`), sempre com PostgreSQL e LocalStack reais:
   - `schema`: migrations reversíveis e cada constraint/trigger em SQL puro;
   - `wagering-api`: API completa, regras, idempotência, referências fora de ordem, eventos, reconciliação;
   - `atomicity`: falha injetada no último passo da transação não deixa escrita parcial;
-  - `concurrency`: 50 envios paralelos da mesma aposta, o cenário 100/80/80, hot wallet com 100 apostas, REFUND e ROLLBACK simultâneos, 20 wallets em paralelo e **3 processos separados**;
-  - `sqs-consumer`: inbox, redelivery, replay, rejeição sem DLQ, DLQ por payload inválido, retry com backoff e DLQ após o limite (com banco realmente inacessível);
-  - `outbox`: dois publishers concorrentes, lease expirado, publicou e morreu antes de marcar, SQS indisponível, commit seguido de SIGKILL e outra instância publicando;
+  - `concurrency`: 50 envios paralelos da mesma aposta, o cenário 100/80/80, hot wallet com 100 apostas, REFUND e ROLLBACK simultâneos, 20 wallets em paralelo, **3 processos separados** e o worker de pendentes disputado por 4 instâncias;
+  - `resilience`: banco derrubado durante o uso (um proxy TCP na frente do PostgreSQL real é fechado) com 503, readiness 503, liveness 200 e reenvio aplicado uma vez quando o banco volta; timeout de lock por HTTP (falha rápido) e por SQS (volta com backoff, sem DLQ);
+  - `sqs-consumer`: inbox, redelivery, replay, rejeição sem DLQ, DLQ por payload inválido, `messageId` reutilizado, retry com backoff e DLQ após o limite (com banco realmente inacessível);
+  - `outbox`: dois publishers concorrentes, lease expirado, publicou e morreu antes de marcar, fila de eventos indisponível, commit seguido de SIGKILL e outra instância publicando;
   - `recovery`: SIGKILL depois do commit e antes do ack, SIGTERM no meio de um lote, 3 instâncias com uma morta no meio da carga e reinício.
 - **Invariante final:** todo arquivo de integração verifica no `afterAll` que, para todas as wallets, `balance == saldo reconstruído pelo ledger`, o último lançamento termina no saldo atual e a versão bate com a cadeia do ledger.
-- **Injeção de falha:** `FAULT_INJECTION=crash-after-commit-before-ack` faz o consumidor se matar com SIGKILL logo depois do commit. É uma variável só para testes, desligada por padrão.
-- A suíte foi executada várias vezes seguidas sem falhas intermitentes. Os testes esperam por condição (`waitFor`), não por tempo fixo.
+- **Injeção de falha:** `FAULT_INJECTION=crash-after-commit-before-ack` faz o consumidor se matar com SIGKILL logo depois do commit. É só para testes: fica desligada por padrão e é **ignorada com `NODE_ENV=production`** (que é como a imagem Docker roda).
+- **Repetibilidade:** a suíte completa (178 testes) foi executada 10 vezes seguidas, com 10 execuções verdes. Os testes esperam por condição (`waitFor`) sempre que possível; os que dependem de tempo real (expiração de lease, visibilidade da fila, timeout de lock) usam margens largas em relação ao tempo configurado.
 
 ## 18. Trade-offs e limitações
 
-- **Lock pessimista segura conexão** enquanto espera. Com uma wallet extremamente quente e pool pequeno, requisições de outras wallets podem esperar conexão. Mitigação: `lock_timeout`, pool dimensionado e o FIFO por `walletId`, que reduz a disputa vinda da fila.
-- **Ordem dos eventos publicados** é por melhor esforço: publishers concorrentes podem intercalar eventos de wallets diferentes, e um retry pode atrasar um evento. Consumidores devem usar `walletVersion` (em `WalletBalanceChanged`) e `eventId` para ordenar e deduplicar.
+- **Lock pessimista segura conexão** enquanto espera. Com uma wallet extremamente quente e pool pequeno, requisições de outras wallets podem esperar conexão. Mitigação: `lock_timeout` sem retry (a espera máxima é um timeout), pool dimensionado e o FIFO por `walletId`, que reduz a disputa vinda da fila.
+- **Pendentes sem atalho:** uma transação em `PENDING_REFERENCE` só é aplicada na próxima tentativa agendada, mesmo que a referência chegue antes. No pior caso espera o intervalo de backoff corrente (até 120 s). Acordar as pendentes na chegada da referência é uma otimização possível.
+- **Ordem dos eventos publicados** é por melhor esforço: publishers concorrentes podem publicar eventos da mesma wallet fora de ordem, e um retry pode atrasar um evento. Consumidores devem usar `walletVersion` (em `WalletBalanceChanged`) e `eventId` para ordenar e deduplicar.
 - **Lease do outbox** precisa ser maior que o tempo de publicar um lote; se não for, outro publisher pode publicar em duplicidade (seguro, mas desnecessário).
 - **Wallet inexistente não é persistida** (seção 9). Um registro de auditoria separado seria o próximo passo, se necessário.
 - **Escala fixa de 2 casas** para todas as moedas, conforme o enunciado. Moedas com 0 ou 3 casas (JPY, KWD) precisariam de escala por moeda.

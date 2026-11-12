@@ -2,6 +2,8 @@ import { ConflictReason } from './errors';
 
 export type Source = 'http' | 'sqs' | 'worker' | 'internal';
 
+export type LogFields = { correlationId?: string; transactionId?: string; walletId?: string; providerId?: string };
+
 /**
  * Porta de observabilidade da aplicação. Os casos de uso relatam fatos;
  * a infraestrutura decide como virar log e métrica (pino + Prometheus).
@@ -16,7 +18,9 @@ export interface Instrumentation {
   warn(msg: string, fields?: Record<string, unknown>): void;
   error(msg: string, fields?: Record<string, unknown>): void;
   /** Acrescenta identificadores ao contexto de log corrente. */
-  enrich(fields: { transactionId?: string; walletId?: string; providerId?: string }): void;
+  enrich(fields: LogFields): void;
+  /** Executa `fn` num contexto de log próprio, isolado do contexto de quem chamou. */
+  scoped<T>(fields: LogFields, fn: () => Promise<T>): Promise<T>;
 }
 
 export const INSTRUMENTATION = Symbol('INSTRUMENTATION');
@@ -31,4 +35,5 @@ export const noopInstrumentation: Instrumentation = {
   warn: () => {},
   error: () => {},
   enrich: () => {},
+  scoped: (_fields, fn) => fn(),
 };

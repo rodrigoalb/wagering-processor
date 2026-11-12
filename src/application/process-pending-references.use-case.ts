@@ -33,45 +33,54 @@ export class ProcessPendingReferencesUseCase {
 
     for (const candidate of due) {
       summary.examined++;
-      try {
-        const status = await withConcurrencyRetry(
-          () =>
-            this.uow.run(async (r) => {
-              const wallet = await r.wallets.lockById(candidate.walletId);
-              const tx = await r.transactions.findById(candidate.id);
-              const now = this.clock.now();
-              if (
-                !wallet ||
-                !tx ||
-                tx.status !== WagerTransactionStatus.PendingReference ||
-                (tx.nextReferenceAttemptAt && tx.nextReferenceAttemptAt > now)
-              ) {
-                return undefined; // outra instância já tratou
-              }
-              this.instrumentation.enrich({ transactionId: tx.id, walletId: tx.walletId, providerId: tx.providerId });
-              await this.processor.settle(r, tx, wallet, {
-                isNew: false,
-                now,
-                source: 'worker',
-                events: { correlationId: tx.correlationId, causationId: tx.id },
-              });
-              return tx.status;
-            }),
-          this.instrumentation,
-          { operation: 'pending-reference' },
-        );
-        if (status === undefined) summary.skipped++;
-        else if (status === WagerTransactionStatus.PendingReference) summary.stillPending++;
-        else summary.settled++;
-      } catch (err) {
-        if (err instanceof ApplicationError && err.kind === 'transient') {
-          // Banco instável: fica para a próxima rodada, nada foi gravado.
-          this.instrumentation.warn('reprocessamento adiado por falha transitória', { transactionId: candidate.id, error: err.message });
-          continue;
+      // Contexto de log por pendente: os ids de uma não vazam para os logs da próxima.
+      await this.instrumentation.scoped({ transactionId: candidate.id, walletId: candidate.walletId }, async () => {
+        try {
+          const status = await withConcurrencyRetry(
+            () =>
+              this.uow.run(async (r) => {
+                const wallet = await r.wallets.lockById(candidate.walletId);
+                const tx = await r.transactions.findById(candidate.id);
+                const now = this.clock.now();
+                if (
+                  !wallet ||
+                  !tx ||
+                  tx.status !== WagerTransactionStatus.PendingReference ||
+                  (tx.nextReferenceAttemptAt && tx.nextReferenceAttemptAt > now)
+                ) {
+                  return undefined; // outra instância já tratou
+                }
+                // O reprocessamento herda o correlationId da submissão original: o rastreio atravessa o worker.
+                this.instrumentation.enrich({
+                  correlationId: tx.correlationId,
+                  transactionId: tx.id,
+                  walletId: tx.walletId,
+                  providerId: tx.providerId,
+                });
+                await this.processor.settle(r, tx, wallet, {
+                  isNew: false,
+                  now,
+                  source: 'worker',
+                  events: { correlationId: tx.correlationId, causationId: tx.id },
+                });
+                return tx.status;
+              }),
+            this.instrumentation,
+            { operation: 'pending-reference' },
+          );
+          if (status === undefined) summary.skipped++;
+          else if (status === WagerTransactionStatus.PendingReference) summary.stillPending++;
+          else summary.settled++;
+        } catch (err) {
+          if (err instanceof ApplicationError && err.kind === 'transient') {
+            // Banco instável: fica para a próxima rodada, nada foi gravado.
+            this.instrumentation.warn('reprocessamento adiado por falha transitória', { transactionId: candidate.id, error: err.message });
+            return;
+          }
+          summary.failed++;
+          await this.markFailed(candidate.id, err);
         }
-        summary.failed++;
-        await this.markFailed(candidate.id, err);
-      }
+      });
     }
     return summary;
   }

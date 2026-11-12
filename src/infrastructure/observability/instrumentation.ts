@@ -1,5 +1,5 @@
 import { Instrumentation } from '../../application/instrumentation';
-import { enrichLogContext, logger } from './logger';
+import { enrichLogContext, logger, withLogContext } from './logger';
 import { metrics } from './metrics';
 
 /** Implementação da porta de observabilidade com pino + prom-client. */
@@ -28,4 +28,5 @@ export const prometheusInstrumentation: Instrumentation = {
   warn: (msg, fields) => logger.warn(fields ?? {}, msg),
   error: (msg, fields) => logger.error(fields ?? {}, msg),
   enrich: (fields) => enrichLogContext(fields),
+  scoped: (fields, fn) => withLogContext(fields, fn),
 };

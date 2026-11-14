@@ -37,7 +37,13 @@ const money = z.object({
 });
 
 const uuid = z.uuid();
-const status = z.enum(Object.values(WagerTransactionStatus) as [string, ...string[]]);
+/**
+ * Status que a API devolve. PENDING existe só em memória (a transação é decidida
+ * na mesma transação SQL em que nasce), então nunca aparece numa resposta.
+ */
+const status = z
+  .enum(Object.values(WagerTransactionStatus).filter((s) => s !== WagerTransactionStatus.Pending) as [string, ...string[]])
+  .meta({ example: 'PROCESSED' });
 const failureCode = z.enum(Object.values(FailureCode) as [string, ...string[]]);
 
 export const errorResponse = z.object({
@@ -114,13 +120,130 @@ export const reconciliationResponse = z.object({
 const check = z.object({ status: z.enum(['ok', 'down']), latencyMs: z.number(), error: z.string().optional() });
 export const readinessResponse = z.object({ status: z.enum(['ok', 'down']), checks: z.object({ postgres: check, sqs: check }) });
 
+// ------------------------------------------------------------------ exemplos de resposta
+// Tipados pelos schemas acima (z.infer): um exemplo fora do formato documentado não compila.
+// test/openapi.int.test.ts também os valida em tempo de execução.
+
+const EXAMPLE_WALLET_ID = '01a1dad9-f2c7-7796-8351-099a679b4aa7';
+const EXAMPLE_TX_ID = '01a1dadc-1e87-7031-985a-67e5b405f630';
+const EXAMPLE_CORRELATION = '01a1dadf-ad21-76b9-9a82-49f73176b543';
+const brl = (amount: string) => ({ amount, currency: 'BRL' });
+
+type Submit = z.infer<typeof submitResponse>;
+const submitProcessed: Submit = { transactionId: EXAMPLE_TX_ID, status: 'PROCESSED', balance: brl('75.00'), idempotentReplay: false };
+const submitReplay: Submit = { ...submitProcessed, idempotentReplay: true };
+const submitPending: Submit = { transactionId: EXAMPLE_TX_ID, status: 'PENDING_REFERENCE', balance: brl('100.00'), idempotentReplay: false };
+const submitRejected: Submit = {
+  transactionId: EXAMPLE_TX_ID,
+  status: 'REJECTED',
+  balance: brl('75.00'),
+  failureCode: 'INSUFFICIENT_FUNDS',
+  idempotentReplay: false,
+};
+
+const walletExample: z.infer<typeof walletResponse> = { id: EXAMPLE_WALLET_ID, playerId: EXAMPLE_PLAYER, balance: brl('100.00'), version: 1 };
+
+const transactionExample: z.infer<typeof transactionResponse> = {
+  id: EXAMPLE_TX_ID,
+  providerId: 'provider-a',
+  externalTransactionId: 'bet-1',
+  idempotencyKey: 'provider-a:bet-1',
+  walletId: EXAMPLE_WALLET_ID,
+  playerId: EXAMPLE_PLAYER,
+  roundId: 'round-1',
+  gameId: 'fortune-chimp',
+  kind: 'BET',
+  money: brl('25.00'),
+  status: 'PROCESSED',
+  failureCode: null,
+  referenceExternalTransactionId: null,
+  referenceTransactionId: null,
+  balance: brl('75.00'),
+  referenceAttempts: 0,
+  nextReferenceAttemptAt: null,
+  createdAt: '2026-11-14T16:24:14.000Z',
+  processedAt: '2026-11-14T16:24:14.000Z',
+};
+
+const ledgerExample: z.infer<typeof ledgerResponse> = {
+  items: [
+    {
+      id: '01a1dad9-f2c9-7a10-9c2e-6a1b2c3d4e5f',
+      transactionId: '01a1dad9-f2c8-7b20-8d3f-7b2c3d4e5f60',
+      direction: 'CREDIT',
+      money: brl('100.00'),
+      balanceBefore: brl('0.00'),
+      balanceAfter: brl('100.00'),
+      walletVersion: 1,
+      createdAt: '2026-11-14T16:20:00.000Z',
+    },
+    {
+      id: '01a1dadc-1e88-7c30-9e4a-8c3d4e5f6071',
+      transactionId: EXAMPLE_TX_ID,
+      direction: 'DEBIT',
+      money: brl('25.00'),
+      balanceBefore: brl('100.00'),
+      balanceAfter: brl('75.00'),
+      walletVersion: 2,
+      createdAt: '2026-11-14T16:24:14.000Z',
+    },
+  ],
+  nextCursor: null,
+};
+
+const reconciliationExample: z.infer<typeof reconciliationResponse> = {
+  walletId: EXAMPLE_WALLET_ID,
+  storedBalance: brl('75.00'),
+  calculatedBalance: brl('75.00'),
+  difference: brl('0.00'),
+  consistent: true,
+  checkedEntries: 2,
+};
+
+const readyExample: z.infer<typeof readinessResponse> = {
+  status: 'ok',
+  checks: { postgres: { status: 'ok', latencyMs: 2 }, sqs: { status: 'ok', latencyMs: 5 } },
+};
+const notReadyExample: z.infer<typeof readinessResponse> = {
+  status: 'down',
+  checks: { postgres: { status: 'down', latencyMs: 2000, error: 'timeout 2000ms' }, sqs: { status: 'ok', latencyMs: 5 } },
+};
+
+/** Exemplos de resposta por endpoint e status, expostos para o teste conferir contra os schemas. */
+export const RESPONSE_EXAMPLES = {
+  submit: { processed: submitProcessed, replay: submitReplay, pending: submitPending, rejected: submitRejected },
+  wallet: walletExample,
+  transaction: transactionExample,
+  ledger: ledgerExample,
+  reconciliation: reconciliationExample,
+  ready: readyExample,
+  notReady: notReadyExample,
+};
+
 // ------------------------------------------------------------------ respostas reutilizáveis
 
-const err = (statusCode: number, description: string) =>
-  ApiResponse({ status: statusCode, description, schema: toSchema(errorResponse) });
+type ErrorBody = z.infer<typeof errorResponse>;
 
-const BAD_REQUEST = err(400, 'Payload inválido (formato, Money, UUID, header ausente). Corrigir antes de reenviar.');
-const UNAVAILABLE = err(503, 'Falha transitória (banco fora do ar, timeout de lock). Pode reenviar com a mesma chave; ver Retry-After.');
+const err = (statusCode: number, description: string, example: ErrorBody) =>
+  ApiResponse({ status: statusCode, description, schema: toSchema(errorResponse), example });
+
+const errorExample = (code: string, message: string, details?: ErrorBody['error']['details']): ErrorBody => ({
+  error: { code, message, ...(details ? { details } : {}) },
+  correlationId: EXAMPLE_CORRELATION,
+});
+
+const BAD_REQUEST = err(
+  400,
+  'Payload inválido (formato, Money, UUID, header ausente). Corrigir antes de reenviar.',
+  errorExample('VALIDATION_ERROR', 'Payload inválido', [{ path: 'money.amount', message: 'amount inválido "1e2": use decimal não negativo com até 2 casas, ex.: "25.00"' }]),
+);
+const UNAVAILABLE = err(
+  503,
+  'Falha transitória (banco fora do ar, timeout de lock). Pode reenviar com a mesma chave; ver Retry-After.',
+  errorExample('TRANSIENT_FAILURE', 'Banco de dados indisponível'),
+);
+const WALLET_NOT_FOUND = err(404, 'Wallet inexistente', errorExample('WALLET_NOT_FOUND', `Wallet ${EXAMPLE_WALLET_ID} não encontrada`));
+const TRANSACTION_NOT_FOUND = err(404, 'Transação inexistente', errorExample('TRANSACTION_NOT_FOUND', `Transação ${EXAMPLE_TX_ID} não encontrada`));
 
 const CORRELATION = ApiHeader({
   name: 'X-Correlation-Id',
@@ -179,9 +302,13 @@ export const ApiCreateWallet = () =>
         BRL: { summary: 'Wallet BRL com 100,00', value: { playerId: EXAMPLE_PLAYER, initialBalance: { amount: '100.00', currency: 'BRL' } } },
       },
     }),
-    ApiResponse({ status: 201, description: 'Criada', schema: toSchema(walletResponse) }),
+    ApiResponse({ status: 201, description: 'Criada', schema: toSchema(walletResponse), example: walletExample }),
     BAD_REQUEST,
-    err(409, 'Já existe wallet para este player e moeda (WALLET_ALREADY_EXISTS)'),
+    err(
+      409,
+      'Já existe wallet para este player e moeda (WALLET_ALREADY_EXISTS)',
+      errorExample('WALLET_ALREADY_EXISTS', `Já existe wallet BRL para o player ${EXAMPLE_PLAYER}`),
+    ),
     UNAVAILABLE,
   );
 
@@ -189,9 +316,9 @@ export const ApiGetWallet = () =>
   applyDecorators(
     ApiOperation({ summary: 'Saldo e versão da wallet' }),
     WALLET_ID,
-    ApiResponse({ status: 200, description: 'Wallet', schema: toSchema(walletResponse) }),
+    ApiResponse({ status: 200, description: 'Wallet', schema: toSchema(walletResponse), example: { ...walletExample, balance: brl('75.00'), version: 2 } }),
     BAD_REQUEST,
-    err(404, 'Wallet inexistente'),
+    WALLET_NOT_FOUND,
   );
 
 export const ApiLedger = () =>
@@ -200,9 +327,9 @@ export const ApiLedger = () =>
     WALLET_ID,
     ApiQuery({ name: 'cursor', required: false, description: 'nextCursor da página anterior' }),
     ApiQuery({ name: 'limit', required: false, schema: { type: 'integer', minimum: 1, maximum: 200, default: 50 } }),
-    ApiResponse({ status: 200, description: 'Página do ledger', schema: toSchema(ledgerResponse) }),
+    ApiResponse({ status: 200, description: 'Página do ledger', schema: toSchema(ledgerResponse), example: ledgerExample }),
     BAD_REQUEST,
-    err(404, 'Wallet inexistente'),
+    WALLET_NOT_FOUND,
   );
 
 export const ApiReconcile = () =>
@@ -212,9 +339,9 @@ export const ApiReconcile = () =>
       description: 'Não corrige nada: divergência é logada, contada em métrica e sinalizada com consistent = false.',
     }),
     WALLET_ID,
-    ApiResponse({ status: 200, description: 'Resultado da conferência', schema: toSchema(reconciliationResponse) }),
+    ApiResponse({ status: 200, description: 'Resultado da conferência', schema: toSchema(reconciliationResponse), example: reconciliationExample }),
     BAD_REQUEST,
-    err(404, 'Wallet inexistente'),
+    WALLET_NOT_FOUND,
   );
 
 export const ApiSubmitTransaction = () =>
@@ -234,15 +361,36 @@ export const ApiSubmitTransaction = () =>
       example: 'provider-a:bet-1',
     }),
     ApiBody({ schema: toSchema(wagerFieldsSchema, 'input'), examples: WAGER_EXAMPLES }),
-    ApiResponse({ status: 201, description: 'Processada (PROCESSED)', schema: toSchema(submitResponse) }),
-    ApiResponse({ status: 200, description: 'Replay de uma transação já processada (idempotentReplay = true)', schema: toSchema(submitResponse) }),
-    ApiResponse({ status: 202, description: 'Aceita aguardando a referência (PENDING_REFERENCE)', schema: toSchema(submitResponse) }),
+    ApiResponse({ status: 201, description: 'Processada (PROCESSED)', schema: toSchema(submitResponse), example: submitProcessed }),
+    ApiResponse({
+      status: 200,
+      description: 'Replay: a mesma requisição já tinha sido processada. Devolve o resultado original, com idempotentReplay = true.',
+      schema: toSchema(submitResponse),
+      example: submitReplay,
+    }),
+    ApiResponse({
+      status: 202,
+      description: 'Aceita aguardando a referência (PENDING_REFERENCE): REFUND/ROLLBACK chegou antes da transação que reverte.',
+      schema: toSchema(submitResponse),
+      example: submitPending,
+    }),
     BAD_REQUEST,
-    err(409, 'Idempotency-Key já usada com outro conteúdo (IDEMPOTENCY_KEY_CONFLICT)'),
+    err(
+      409,
+      'Idempotency-Key já usada com outro conteúdo (IDEMPOTENCY_KEY_CONFLICT)',
+      errorExample('IDEMPOTENCY_KEY_CONFLICT', 'Idempotency-Key "provider-a:bet-1" já foi usada com outro payload'),
+    ),
     ApiResponse({
       status: 422,
       description: 'Rejeitada por regra de negócio: status REJECTED com failureCode (ou WALLET_NOT_FOUND no formato de erro)',
       schema: { oneOf: [toSchema(submitResponse), toSchema(errorResponse)] },
+      examples: {
+        rejeitada: { summary: 'Transação rejeitada (ex.: aposta sem saldo)', value: submitRejected },
+        walletInexistente: {
+          summary: 'Wallet do corpo não existe (nada é gravado)',
+          value: errorExample('WALLET_NOT_FOUND', `Wallet ${EXAMPLE_WALLET_ID} não encontrada`),
+        },
+      },
     }),
     UNAVAILABLE,
   );
@@ -251,9 +399,9 @@ export const ApiGetTransaction = () =>
   applyDecorators(
     ApiOperation({ summary: 'Consulta transação pelo id interno' }),
     ApiParam({ name: 'transactionId', format: 'uuid', description: 'transactionId devolvido pela submissão' }),
-    ApiResponse({ status: 200, description: 'Transação', schema: toSchema(transactionResponse) }),
+    ApiResponse({ status: 200, description: 'Transação', schema: toSchema(transactionResponse), example: transactionExample }),
     BAD_REQUEST,
-    err(404, 'Transação inexistente'),
+    TRANSACTION_NOT_FOUND,
   );
 
 export const ApiGetTransactionByExternal = () =>
@@ -261,8 +409,8 @@ export const ApiGetTransactionByExternal = () =>
     ApiOperation({ summary: 'Consulta transação pelo id do provedor' }),
     ApiParam({ name: 'providerId', example: 'provider-a' }),
     ApiParam({ name: 'externalTransactionId', example: 'bet-1' }),
-    ApiResponse({ status: 200, description: 'Transação', schema: toSchema(transactionResponse) }),
-    err(404, 'Transação inexistente'),
+    ApiResponse({ status: 200, description: 'Transação', schema: toSchema(transactionResponse), example: transactionExample }),
+    TRANSACTION_NOT_FOUND,
   );
 
 export const ApiLive = () =>
@@ -274,8 +422,8 @@ export const ApiLive = () =>
 export const ApiReady = () =>
   applyDecorators(
     ApiOperation({ summary: 'Readiness: PostgreSQL e SQS alcançáveis' }),
-    ApiResponse({ status: 200, description: 'Pronto', schema: toSchema(readinessResponse) }),
-    ApiResponse({ status: 503, description: 'Alguma dependência fora', schema: toSchema(readinessResponse) }),
+    ApiResponse({ status: 200, description: 'Pronto', schema: toSchema(readinessResponse), example: readyExample }),
+    ApiResponse({ status: 503, description: 'Alguma dependência fora', schema: toSchema(readinessResponse), example: notReadyExample }),
   );
 
 export const ApiMetrics = () =>

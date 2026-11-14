@@ -7,6 +7,7 @@ import {
   ledgerResponse,
   readinessResponse,
   reconciliationResponse,
+  RESPONSE_EXAMPLES,
   submitResponse,
   transactionResponse,
   walletResponse,
@@ -116,6 +117,58 @@ describe('Swagger', () => {
     expect((await send('REFUND')).body).toMatchObject({ status: 'PROCESSED', balance: { amount: '160.00' } });
     // Como o próprio exemplo avisa: a BET já foi revertida pelo REFUND.
     expect((await send('ROLLBACK')).body).toMatchObject({ status: 'REJECTED', failureCode: 'REFERENCE_ALREADY_REVERSED' });
+  });
+});
+
+describe('exemplos de resposta do documento', () => {
+  const responses = (path: string, method: string) => doc.paths[path]![method]!.responses as Record<string, any>;
+  const example = (path: string, method: string, statusCode: string) => responses(path, method)[statusCode].content['application/json'].example;
+
+  test('cada status da submissão tem um exemplo coerente com o seu significado', () => {
+    const path = '/wagering/transactions';
+    expect(example(path, 'post', '201')).toMatchObject({ status: 'PROCESSED', idempotentReplay: false });
+    expect(example(path, 'post', '201').failureCode).toBeUndefined();
+    expect(example(path, 'post', '200')).toMatchObject({ status: 'PROCESSED', idempotentReplay: true });
+    expect(example(path, 'post', '202')).toMatchObject({ status: 'PENDING_REFERENCE' });
+    expect(example(path, 'post', '409').error.code).toBe('IDEMPOTENCY_KEY_CONFLICT');
+    expect(example(path, 'post', '400').error.code).toBe('VALIDATION_ERROR');
+    expect(example(path, 'post', '503').error.code).toBe('TRANSIENT_FAILURE');
+    const rejected = responses(path, 'post')['422'].content['application/json'].examples;
+    expect(rejected.rejeitada.value).toMatchObject({ status: 'REJECTED', failureCode: 'INSUFFICIENT_FUNDS' });
+    expect(rejected.walletInexistente.value.error.code).toBe('WALLET_NOT_FOUND');
+  });
+
+  test('os códigos de erro dos exemplos batem com o endpoint', () => {
+    expect(example('/wallets', 'post', '409').error.code).toBe('WALLET_ALREADY_EXISTS');
+    expect(example('/wallets/{walletId}', 'get', '404').error.code).toBe('WALLET_NOT_FOUND');
+    expect(example('/wagering/transactions/{transactionId}', 'get', '404').error.code).toBe('TRANSACTION_NOT_FOUND');
+  });
+
+  test('PENDING não aparece como status possível de resposta (a API nunca o devolve)', () => {
+    const json = JSON.stringify(doc.paths);
+    expect(json).not.toContain('"PENDING"');
+  });
+
+  test('todos os exemplos obedecem aos schemas de saída', () => {
+    for (const ex of Object.values(RESPONSE_EXAMPLES.submit)) conforms(submitResponse, ex);
+    conforms(walletResponse, RESPONSE_EXAMPLES.wallet);
+    conforms(transactionResponse, RESPONSE_EXAMPLES.transaction);
+    conforms(ledgerResponse, RESPONSE_EXAMPLES.ledger);
+    conforms(reconciliationResponse, RESPONSE_EXAMPLES.reconciliation);
+    conforms(readinessResponse, RESPONSE_EXAMPLES.ready);
+    conforms(readinessResponse, RESPONSE_EXAMPLES.notReady);
+    // Todo exemplo de erro publicado no documento tem o formato de erro.
+    for (const methods of Object.values(doc.paths)) {
+      for (const op of Object.values(methods)) {
+        for (const [code, resp] of Object.entries(op.responses as Record<string, any>)) {
+          const content = resp.content?.['application/json'];
+          const values = [content?.example, ...Object.values(content?.examples ?? {}).map((e: any) => e.value)].filter(Boolean);
+          for (const v of values) {
+            if (Number(code) >= 400 && v.error) conforms(errorResponse, v);
+          }
+        }
+      }
+    }
   });
 });
 

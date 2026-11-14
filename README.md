@@ -21,7 +21,9 @@ As decisões técnicas, trade-offs e limitações estão em **[ARCHITECTURE.md](
 ## Pré-requisitos
 
 - **Docker** com Docker Compose v2.
-- **Bun 1.x** (para rodar fora do Docker e para os testes): `curl -fsSL https://bun.sh/install | bash`.
+- **Bun 1.x** (para rodar fora do Docker e para os testes): `curl -fsSL https://bun.sh/install | bash`. No Linux/WSL o instalador exige `unzip` (`sudo apt install unzip`).
+
+Só o Docker é necessário para subir e usar o sistema. O Bun só é necessário para rodar os testes ou a aplicação fora do Docker.
 
 Portas usadas no host: `5440` (PostgreSQL), `4570` (LocalStack), `3001` a `3003` (três instâncias da aplicação).
 
@@ -74,6 +76,10 @@ PORT=3000 bun run start
 ## Testes
 
 ```bash
+bun install
+```
+
+```bash
 bun run infra:up
 ```
 
@@ -81,7 +87,9 @@ bun run infra:up
 bun run test
 ```
 
-Os testes de integração usam o PostgreSQL e o LocalStack reais do compose: banco `wagering_test` (recriado pelas migrations a cada arquivo) e filas exclusivas por arquivo. Vários testes sobem a aplicação como **processos separados** e os matam com `SIGKILL`/`SIGTERM`. Resultado atual: **184 testes, 0 falhas**, cerca de 1 minuto. A suíte anterior ao Swagger (178 testes) foi repetida 10 vezes seguidas, sempre verde.
+Os testes usam um banco (`wagering_test`) e filas próprios, então podem rodar com o compose completo no ar.
+
+Os testes de integração usam o PostgreSQL e o LocalStack reais do compose: banco `wagering_test` (recriado pelas migrations a cada arquivo) e filas exclusivas por arquivo. Vários testes sobem a aplicação como **processos separados** e os matam com `SIGKILL`/`SIGTERM`. Resultado atual: **188 testes, 0 falhas**, cerca de 1 minuto. A suíte anterior ao Swagger (178 testes) foi repetida 10 vezes seguidas, sempre verde.
 
 Cobertura dos cenários obrigatórios da seção 13 do desafio:
 
@@ -105,13 +113,20 @@ Com o compose no ar, abra no navegador **http://localhost:3001/docs** (ou 3002/3
 
 O Swagger **não é pedido pelo enunciado**: é uma conveniência para testar a API pelo navegador. Os corpos de entrada documentados são gerados dos mesmos schemas zod que validam as requisições, e `test/openapi.int.test.ts` confere que as respostas reais batem com os schemas de saída documentados.
 
+Os campos já abrem editáveis; **Execute** envia a requisição e a resposta aparece em **Server response**. Se a página mostrar exemplos antigos depois de uma atualização, recarregue com Ctrl+F5.
+
 Roteiro rápido:
 
-1. **Wallets > POST /wallets > Try it out > Execute.** Copie o `id` da resposta. Para criar outra wallet, troque o `playerId` (uma por player e moeda).
-2. **Wagering > POST /wagering/transactions.** No seletor **Examples**, escolha `BET`; no corpo, troque `walletId` pelo id copiado. O header `Idempotency-Key` já vem preenchido (`provider-a:bet-1`).
+1. **Wallets > POST /wallets > Execute.** Copie o `id` da resposta. Há uma wallet por player e moeda: para criar outra, troque o `playerId` (e use esse `playerId` também nas transações).
+2. **Wagering > POST /wagering/transactions.** No seletor **Examples**, escolha `BET` e, no corpo, troque `COLE-AQUI-O-ID-DA-WALLET` pelo id copiado. O header `Idempotency-Key` já vem preenchido (`provider-a:bet-1`). **Execute**: 201, saldo debitado.
 3. **Execute** de novo sem mudar nada: mesma resposta com `idempotentReplay: true` (HTTP 200). Mude o valor e mantenha a chave: 409.
 4. Para cada transação nova, troque o `externalTransactionId` e a `Idempotency-Key` (ex.: `refund-1` e `provider-a:refund-1`). Os exemplos `WIN`, `LOSS`, `REFUND` e `ROLLBACK` apontam para `bet-1`.
 5. **Wallets > GET /wallets/{walletId}/ledger** e **POST /wallets/{walletId}/reconciliation** para conferir o resultado.
+
+Dois cuidados:
+
+- Escolher outro item em **Examples** reescreve o corpo inteiro: o `walletId` volta para o texto de exemplo (e a API responde 400 `Invalid UUID`). Troque-o de novo a cada exemplo.
+- O header `Idempotency-Key` **não** muda junto com o exemplo. Cada transação nova precisa de uma chave nova.
 
 O envio pela fila SQS não é HTTP e não aparece no Swagger: veja [Mensagens SQS](#mensagens-sqs).
 
@@ -151,6 +166,8 @@ curl -s -X POST localhost:3001/wagering/transactions \
 ```
 
 REFUND e ROLLBACK levam `referenceExternalTransactionId`.
+
+**Referência fora de ordem:** se o REFUND/ROLLBACK chega antes da transação que ele reverte, a resposta é `202 PENDING_REFERENCE`. Um worker tenta de novo com backoff exponencial (2 s, 4 s, 8 s... até 120 s, por 10 tentativas). Quando a referência chega, a pendente é aplicada na próxima tentativa agendada, o que pode levar **até 2 minutos**; acompanhe por `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}`. Se a referência nunca chegar, a transação termina `REJECTED` com `REFERENCE_NOT_FOUND`.
 
 ## Mensagens SQS
 
@@ -192,7 +209,8 @@ src/
   domain/            Money, Wallet, WagerTransaction, WalletLedgerEntry, Inbox/Outbox, eventos, regras
   application/       casos de uso, portas, payloadHash, retry
   infrastructure/    MikroORM (schemas, repositórios, migrations), SQS, outbox publisher, workers, logs, métricas
-  presentation/      controllers HTTP, contratos, filtro de erros, auth (ponto de extensão), consumidor SQS
+  presentation/      controllers HTTP, contratos, Swagger, filtro de erros, auth (ponto de extensão), consumidor SQS
+                     (testes unitários ficam ao lado do código: src/**/*.spec.ts)
 test/                testes de integração (PostgreSQL e LocalStack reais)
 infra/               init das filas no LocalStack e do banco de teste
 ```

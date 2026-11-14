@@ -28,6 +28,8 @@ services:
       POSTGRES_DB: wagering
     ports: ["5440:5432"]
     volumes:
+      # Volume nomeado: "docker compose down" preserva os dados; "down -v" apaga.
+      - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
@@ -74,3 +76,6 @@ services:
     <<: *app
     environment: { <<: *app-env, INSTANCE_ID: app-3 }
     ports: ["3003:3000"]
+
+volumes:
+  postgres-data:

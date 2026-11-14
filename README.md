@@ -39,6 +39,12 @@ Sobe PostgreSQL, LocalStack (com as filas `wager-transactions.fifo`, `wager-tran
 curl localhost:3001/health/ready
 ```
 
+Para parar mantendo os dados (o banco fica no volume `wagering_postgres-data` e volta no próximo `up`):
+
+```bash
+docker compose down
+```
+
 Para derrubar tudo e apagar os dados:
 
 ```bash

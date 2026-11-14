@@ -4,6 +4,7 @@ import { AppModule } from './app.module';
 import { loadConfig } from './infrastructure/config';
 import { logger, setLogInstanceId } from './infrastructure/observability/logger';
 import { correlationMiddleware } from './presentation/http/correlation.middleware';
+import { setupOpenApi } from './presentation/http/openapi';
 
 export async function bootstrap(config = loadConfig()) {
   setLogInstanceId(config.instanceId);
@@ -11,6 +12,8 @@ export async function bootstrap(config = loadConfig()) {
   app.use(correlationMiddleware);
   // SIGTERM/SIGINT disparam beforeApplicationShutdown: consumidor e workers param com elegância.
   app.enableShutdownHooks();
+  // Swagger UI em /docs (conveniência para testes manuais; fora do escopo do desafio).
+  setupOpenApi(app);
   await app.listen(config.port);
   logger.info({ port: config.port }, 'wagering-processor no ar');
   return app;

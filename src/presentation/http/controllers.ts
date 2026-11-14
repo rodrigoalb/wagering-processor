@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, HttpCode, Inject, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Inject, Param, Post, Query, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { CreateWalletUseCase } from '../../application/create-wallet.use-case';
 import { WalletQueries } from '../../application/queries';
@@ -11,10 +11,26 @@ import { Public } from './auth';
 import { correlationIdOf } from './correlation.middleware';
 import { CREATE_WALLET, HEALTH, SUBMIT_WAGER, WALLET_QUERIES } from './tokens';
 import { HealthService } from './health.service';
+import {
+  ApiCreateWallet,
+  ApiGetTransaction,
+  ApiGetTransactionByExternal,
+  ApiGetWallet,
+  ApiLedger,
+  ApiLive,
+  ApiMetrics,
+  ApiOps,
+  ApiReady,
+  ApiReconcile,
+  ApiSubmitTransaction,
+  ApiWagering,
+  ApiWallets,
+} from './openapi';
 
 const uuidParam = z.uuid();
 const idParam = (value: string, name: string) => parse(z.object({ [name]: uuidParam }), { [name]: value })[name] as string;
 
+@ApiWallets()
 @Controller('wallets')
 export class WalletsController {
   constructor(
@@ -24,16 +40,19 @@ export class WalletsController {
 
   @Post()
   @HttpCode(201)
+  @ApiCreateWallet()
   create(@Body() body: unknown, @Req() req: Request) {
     return this.createWallet.execute(parse(createWalletSchema, body), correlationIdOf(req));
   }
 
   @Get(':walletId')
+  @ApiGetWallet()
   get(@Param('walletId') walletId: string) {
     return this.queries.getWallet(idParam(walletId, 'walletId'));
   }
 
   @Get(':walletId/ledger')
+  @ApiLedger()
   ledger(@Param('walletId') walletId: string, @Query() query: unknown) {
     const { cursor, limit } = parse(ledgerQuerySchema, query);
     return this.queries.getLedger(idParam(walletId, 'walletId'), cursor, limit);
@@ -41,6 +60,7 @@ export class WalletsController {
 
   @Post(':walletId/reconciliation')
   @HttpCode(200)
+  @ApiReconcile()
   reconcile(@Param('walletId') walletId: string) {
     return this.queries.reconcile(idParam(walletId, 'walletId'));
   }
@@ -61,6 +81,7 @@ function submitStatus(status: WagerTransactionStatus, replay: boolean): number {
   }
 }
 
+@ApiWagering()
 @Controller()
 export class WageringController {
   constructor(
@@ -69,16 +90,17 @@ export class WageringController {
   ) {}
 
   @Post('wagering/transactions')
+  @ApiSubmitTransaction()
   async create(
     @Body() body: unknown,
-    @Headers('idempotency-key') idempotencyKeyHeader: string | undefined,
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
     const started = performance.now();
     try {
+      // Lido direto da requisição (e não com @Headers) para o Swagger mostrar só o header documentado.
       const idempotencyKey = parse(z.object({ 'Idempotency-Key': idempotencyKeySchema }), {
-        'Idempotency-Key': idempotencyKeyHeader,
+        'Idempotency-Key': req.header('idempotency-key'),
       })['Idempotency-Key'];
       const fields = parse(wagerFieldsSchema, body);
       const result = await this.submit.execute(
@@ -93,27 +115,32 @@ export class WageringController {
   }
 
   @Get('wagering/transactions/:transactionId')
+  @ApiGetTransaction()
   get(@Param('transactionId') transactionId: string) {
     return this.queries.getTransaction(idParam(transactionId, 'transactionId'));
   }
 
   @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
+  @ApiGetTransactionByExternal()
   getByExternal(@Param('providerId') providerId: string, @Param('externalTransactionId') externalTransactionId: string) {
     return this.queries.getTransactionByExternalId(providerId, externalTransactionId);
   }
 }
 
 @Public()
+@ApiOps()
 @Controller()
 export class OpsController {
   constructor(@Inject(HEALTH) private readonly health: HealthService) {}
 
   @Get('health/live')
+  @ApiLive()
   live() {
     return { status: 'ok' };
   }
 
   @Get('health/ready')
+  @ApiReady()
   async ready(@Res({ passthrough: true }) res: Response) {
     const report = await this.health.readiness();
     res.status(report.status === 'ok' ? 200 : 503);
@@ -121,6 +148,7 @@ export class OpsController {
   }
 
   @Get('metrics')
+  @ApiMetrics()
   async metrics(@Res() res: Response) {
     res.setHeader('Content-Type', registry.contentType);
     res.send(await registry.metrics());

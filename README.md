@@ -12,6 +12,7 @@ As decisões técnicas, trade-offs e limitações estão em **[ARCHITECTURE.md](
 - [Subir tudo com Docker Compose](#subir-tudo-com-docker-compose)
 - [Rodar localmente com Bun](#rodar-localmente-com-bun)
 - [Testes](#testes)
+- [Testar pelo Swagger](#testar-pelo-swagger)
 - [API](#api)
 - [Mensagens SQS](#mensagens-sqs)
 - [Configuração](#configuração)
@@ -80,7 +81,7 @@ bun run infra:up
 bun run test
 ```
 
-Os testes de integração usam o PostgreSQL e o LocalStack reais do compose: banco `wagering_test` (recriado pelas migrations a cada arquivo) e filas exclusivas por arquivo. Vários testes sobem a aplicação como **processos separados** e os matam com `SIGKILL`/`SIGTERM`. Resultado atual: **178 testes, 0 falhas**, cerca de 1 minuto (a suíte foi repetida 10 vezes seguidas, sempre verde).
+Os testes de integração usam o PostgreSQL e o LocalStack reais do compose: banco `wagering_test` (recriado pelas migrations a cada arquivo) e filas exclusivas por arquivo. Vários testes sobem a aplicação como **processos separados** e os matam com `SIGKILL`/`SIGTERM`. Resultado atual: **184 testes, 0 falhas**, cerca de 1 minuto. A suíte anterior ao Swagger (178 testes) foi repetida 10 vezes seguidas, sempre verde.
 
 Cobertura dos cenários obrigatórios da seção 13 do desafio:
 
@@ -91,11 +92,28 @@ Cobertura dos cenários obrigatórios da seção 13 do desafio:
 | Atomicidade entre wallet, ledger, inbox e outbox | `test/atomicity.int.test.ts` |
 | Inbox e redelivery; retry e DLQ; `messageId` reutilizado | `test/sqs-consumer.int.test.ts` |
 | PostgreSQL indisponível (503 e recuperação); timeout de lock por HTTP e SQS | `test/resilience.int.test.ts` |
+| Swagger: todas as rotas documentadas e respostas reais conforme os schemas | `test/openapi.int.test.ts` |
 | Publishers concorrentes sobre o mesmo outbox | `test/outbox.int.test.ts` |
 | Mesma aposta 50 vezes em paralelo; 100/80/80; wallets distintas; 3 processos; worker de pendentes com várias instâncias | `test/concurrency.int.test.ts` |
 | Worker morto depois do commit e antes do ack; SIGTERM; reinício com consistência | `test/recovery.int.test.ts` |
 | ROLLBACK/REFUND antes da referência | `test/wagering-api.int.test.ts` |
 | Invariante `wallet.balance == saldo do ledger` | `afterAll` de todos os arquivos de integração |
+
+## Testar pelo Swagger
+
+Com o compose no ar, abra no navegador **http://localhost:3001/docs** (ou 3002/3003: qualquer instância serve). O documento OpenAPI fica em `/docs-json`.
+
+O Swagger **não é pedido pelo enunciado**: é uma conveniência para testar a API pelo navegador. Os corpos de entrada documentados são gerados dos mesmos schemas zod que validam as requisições, e `test/openapi.int.test.ts` confere que as respostas reais batem com os schemas de saída documentados.
+
+Roteiro rápido:
+
+1. **Wallets > POST /wallets > Try it out > Execute.** Copie o `id` da resposta. Para criar outra wallet, troque o `playerId` (uma por player e moeda).
+2. **Wagering > POST /wagering/transactions.** No seletor **Examples**, escolha `BET`; no corpo, troque `walletId` pelo id copiado. O header `Idempotency-Key` já vem preenchido (`provider-a:bet-1`).
+3. **Execute** de novo sem mudar nada: mesma resposta com `idempotentReplay: true` (HTTP 200). Mude o valor e mantenha a chave: 409.
+4. Para cada transação nova, troque o `externalTransactionId` e a `Idempotency-Key` (ex.: `refund-1` e `provider-a:refund-1`). Os exemplos `WIN`, `LOSS`, `REFUND` e `ROLLBACK` apontam para `bet-1`.
+5. **Wallets > GET /wallets/{walletId}/ledger** e **POST /wallets/{walletId}/reconciliation** para conferir o resultado.
+
+O envio pela fila SQS não é HTTP e não aparece no Swagger: veja [Mensagens SQS](#mensagens-sqs).
 
 ## API
 
@@ -112,6 +130,7 @@ Todas as respostas de erro têm o formato `{ "error": { "code", "message", "deta
 | `GET` | `/providers/:providerId/wagering/transactions/:externalTransactionId` | Consulta por id do provedor |
 | `GET` | `/health/live`, `/health/ready` | Liveness e readiness (PostgreSQL + SQS) |
 | `GET` | `/metrics` | Métricas Prometheus |
+| `GET` | `/docs`, `/docs-json` | Swagger UI e documento OpenAPI (conveniência, fora do enunciado) |
 
 Exemplo:
 
